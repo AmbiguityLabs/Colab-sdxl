@@ -278,7 +278,7 @@
       }
 
       try {
-        const r = await fetch("/generate_stream", {
+        const r = await fetch("/start_gen", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             prompt: prompt.value, neg_prompt: neg.value, width: w, height: h,
@@ -290,33 +290,46 @@
             upscale: hr_toggle.checked
           })
         });
-        const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+        const { job_id } = await r.json();
+        let lastLogCount = 0;
+
         while (true) {
-          const { value, done } = await rd.read(); if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split("\n\n"); buf = lines.pop();
-          for (const ln of lines) {
-            if (!ln.startsWith("data: ")) continue;
-            const d = JSON.parse(ln.slice(6));
-            if (d.type === "log") { addLog(d.message); }
-            else if (d.type === "preview") {
-              const im = document.getElementById(`im_${d.index}`);
-              im.src = d.image; im.style.display = "block";
-              document.getElementById(`bg_${d.index}`).innerText = `Step ${d.step}/${d.total_steps}`;
-              document.getElementById(`pr_${d.index}`).style.width = `${(d.step/d.total_steps)*100}%`;
-              status_text.innerText = `Denoising ${d.index+1}/${b}`;
-            } else if (d.type === "status") {
-              document.getElementById(`bg_${d.index}`).innerText = d.text;
-              status_text.innerText = d.text;
-            } else if (d.type === "final") {
-              const im = document.getElementById(`im_${d.index}`);
-              im.src = d.image; document.getElementById(`dl_${d.index}`).href = d.image;
-              document.getElementById(`bg_${d.index}`).style.display = "none";
-              document.getElementById(`pr_${d.index}`).style.display = "none";
-              document.getElementById(`ov_${d.index}`).style.display = "flex";
-            } else if (d.type === "done") { status_text.innerText = "Completed"; }
-            else if (d.type === "error") { status_text.innerText = "Error"; addLog("ERROR:\n" + d.message); }
+          await new Promise(res => setTimeout(res, 800));
+          const sr = await fetch(`/job_status/${job_id}`);
+          const d = await sr.json();
+
+          if (d.logs && d.logs.length > lastLogCount) {
+            d.logs.slice(lastLogCount).forEach(m => addLog(m));
+            lastLogCount = d.logs.length;
           }
+
+          for (const [idx, imgData] of Object.entries(d.previews || {})) {
+            if (d.finals && d.finals[idx]) continue;
+            const im = document.getElementById(`im_${idx}`);
+            im.src = imgData; im.style.display = "block";
+            if (d.badges && d.badges[idx]) {
+              document.getElementById(`bg_${idx}`).innerText = d.badges[idx];
+              status_text.innerText = d.badges[idx];
+            } else if (d.steps && d.steps[idx]) {
+              const [cur, tot] = d.steps[idx];
+              document.getElementById(`bg_${idx}`).innerText = `Step ${cur}/${tot}`;
+              document.getElementById(`pr_${idx}`).style.width = `${(cur/tot)*100}%`;
+              status_text.innerText = `Denoising ${parseInt(idx)+1}/${b}`;
+            }
+          }
+
+          for (const [idx, finalData] of Object.entries(d.finals || {})) {
+            const im = document.getElementById(`im_${idx}`);
+            if (im.src !== finalData) {
+              im.src = finalData; document.getElementById(`dl_${idx}`).href = finalData;
+              document.getElementById(`bg_${idx}`).style.display = "none";
+              document.getElementById(`pr_${idx}`).style.display = "none";
+              document.getElementById(`ov_${idx}`).style.display = "flex";
+            }
+          }
+
+          if (d.status === "done") { status_text.innerText = "Completed"; break; }
+          if (d.status === "error") { status_text.innerText = "Error"; addLog("ERROR:\n" + d.error); break; }
         }
       } catch (e) { status_text.innerText = "Error"; addLog("Fetch Error: " + e); }
       finally { gbtn.disabled = false; }
