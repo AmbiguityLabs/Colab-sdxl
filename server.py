@@ -1,8 +1,30 @@
-import subprocess, sys, os, shutil, time, base64, threading, requests, json, queue, traceback
+import sys, os, subprocess, shutil, time, base64, threading, requests, json, queue, traceback
 from io import BytesIO
 from urllib.parse import urlparse
 
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "diffusers", "transformers", "accelerate", "safetensors", "peft", "torch", "fastapi", "uvicorn", "requests", "ultralytics", "spandrel", "python-multipart"])
+# 1. Instant GPU Check (Saves 10+ minutes if CPU runtime is active)
+import torch
+if not torch.cuda.is_available():
+    raise RuntimeError("GPU is NOT active! Go to Runtime -> Change runtime type -> Select T4 GPU and run again.")
+
+print(f"GPU Detected: {torch.cuda.get_device_name(0)}")
+
+# 2. Fast Install (Only missing packages, never touches Colab's CUDA PyTorch)
+needed = []
+for pkg, mod in [
+    ("diffusers", "diffusers"), ("transformers", "transformers"), ("accelerate", "accelerate"),
+    ("safetensors", "safetensors"), ("peft", "peft"), ("fastapi", "fastapi"),
+    ("uvicorn", "uvicorn"), ("ultralytics", "ultralytics"), ("spandrel", "spandrel"),
+    ("python-multipart", "multipart")
+]:
+    try:
+        __import__(mod)
+    except ImportError:
+        needed.append(pkg)
+
+if needed:
+    print(f"Installing missing packages: {', '.join(needed)}...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *needed])
 
 import spandrel, uvicorn
 import numpy as np
@@ -25,9 +47,14 @@ local_model = "/content/model.safetensors"
 os.makedirs(f"{base}/outputs", exist_ok=True)
 os.makedirs(lora_dir, exist_ok=True)
 
+drive_model = f"{base}/models/waiIllustriousSDXL_v170.safetensors"
 if not os.path.exists(local_model):
-    shutil.copy(f"{base}/models/waiIllustriousSDXL_v170.safetensors", local_model)
+    if not os.path.exists(drive_model):
+        raise FileNotFoundError(f"Base model not found at: {drive_model}")
+    print("Copying base model to local SSD...")
+    shutil.copy(drive_model, local_model)
 
+print("Loading SDXL Pipeline...")
 pipe = StableDiffusionXLPipeline.from_single_file(local_model, torch_dtype=torch.float16, use_safetensors=True)
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 pipe.to("cuda")
@@ -184,4 +211,5 @@ def index():
 
 threading.Thread(target=lambda: uvicorn.run(app, host="127.0.0.1", port=8000, log_level="error"), daemon=True).start()
 time.sleep(2)
+print("Studio ready. Opening window...")
 output.serve_kernel_port_as_window(8000)
