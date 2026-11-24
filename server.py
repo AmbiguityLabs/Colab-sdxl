@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "diffusers", "transformers", "accelerate", "safetensors", "peft", "torch", "fastapi", "uvicorn", "requests", "ultralytics", "spandrel", "python-multipart"])
 
-import torch, spandrel, uvicorn
+import spandrel, uvicorn
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 from fastapi import FastAPI, UploadFile, File
