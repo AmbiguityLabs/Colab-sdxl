@@ -14,7 +14,7 @@ from diffusers import StableDiffusionXLPipeline, AutoPipelineForInpainting, Eule
 from ultralytics import YOLO
 from google.colab import drive, output
 
-UI_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/index.html"
+UI_URL = "https://raw.githubusercontent.com/AmbiguityLabs/Colab-sdxl/main/index.html"
 
 if not os.path.exists('/content/drive/MyDrive'):
     drive.mount('/content/drive')
