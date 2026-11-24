@@ -1,15 +1,13 @@
-import sys, os, subprocess, shutil, time, base64, threading, requests, json, queue, traceback
+import sys, os, subprocess, shutil, time, base64, threading, requests, json, traceback
 from io import BytesIO
 from urllib.parse import urlparse
 
-# 1. Instant GPU Check (Saves 10+ minutes if CPU runtime is active)
 import torch
 if not torch.cuda.is_available():
     raise RuntimeError("GPU is NOT active! Go to Runtime -> Change runtime type -> Select T4 GPU and run again.")
 
 print(f"GPU Detected: {torch.cuda.get_device_name(0)}")
 
-# 2. Fast Install (Only missing packages, never touches Colab's CUDA PyTorch)
 needed = []
 for pkg, mod in [
     ("diffusers", "diffusers"), ("transformers", "transformers"), ("accelerate", "accelerate"),
@@ -30,7 +28,7 @@ import spandrel, uvicorn
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from diffusers import StableDiffusionXLPipeline, AutoPipelineForInpainting, EulerAncestralDiscreteScheduler
 from ultralytics import YOLO
@@ -65,6 +63,7 @@ hand_yolo = YOLO(f"{base}/adetailer/hand_yolov8n.pt") if os.path.exists(f"{base}
 upscale_model = spandrel.ModelLoader().load_from_file(f"{base}/upscalers/RealESRGAN_x4plus_anime_6B.pth").eval().half().to("cuda") if os.path.exists(f"{base}/upscalers/RealESRGAN_x4plus_anime_6B.pth") else None
 
 active_lora = {"name": None}
+jobs = {}
 
 def get_drive_loras():
     if not os.path.exists(lora_dir): return []
@@ -165,27 +164,35 @@ class Req(BaseModel):
     batch_count: int = 1; lora_name: str = "none"; lora_weight: float = 0.8
     fix_face: bool = False; fix_hand: bool = False; ad_str: float = 0.4; ad_blur: int = 4; upscale: bool = False
 
-@app.post("/generate_stream")
-def gen(req: Req):
-    q = queue.Queue()
+@app.post("/start_gen")
+def start_gen(req: Req):
+    job_id = str(int(time.time() * 1000))
+    jobs[job_id] = {
+        "status": "running", "logs": ["Starting generation pipeline..."],
+        "previews": {}, "finals": {}, "steps": {}, "badges": {}, "error": None
+    }
+    job = jobs[job_id]
+
     def log(msg):
-        q.put(json.dumps({"type": "log", "message": msg}))
+        job["logs"].append(msg)
 
     def work():
         try:
-            log("Starting generation pipeline...")
             apply_lora(req.lora_name, req.lora_weight, log)
             for i in range(max(1, min(req.batch_count, 8))):
                 log(f"Generating image {i+1}/{req.batch_count} ({req.width}x{req.height}, steps={req.steps})")
-                cb = lambda p, s, ts, kw: (q.put(json.dumps({"type":"preview","index":i,"step":s+1,"total_steps":req.steps,"image":to_b64(kw["latents"])})), kw)[1]
+                def cb(p, s, ts, kw):
+                    job["previews"][i] = to_b64(kw["latents"])
+                    job["steps"][i] = [s + 1, req.steps]
+                    return kw
                 img = pipe(prompt=req.prompt, negative_prompt=req.neg_prompt, width=req.width, height=req.height, num_inference_steps=req.steps, guidance_scale=req.cfg, callback_on_step_end=cb).images[0]
 
                 if req.fix_face or req.fix_hand:
-                    q.put(json.dumps({"type":"status","index":i,"text":"Detailer"}))
+                    job["badges"][i] = "Detailer"
                     img = adetail(img, req.prompt, req.neg_prompt, req.steps, req.cfg, req.fix_face, req.fix_hand, req.ad_str, req.ad_blur, log)
 
                 if req.upscale and upscale_model:
-                    q.put(json.dumps({"type":"status","index":i,"text":"Upscaling 4x"}))
+                    job["badges"][i] = "Upscaling 4x"
                     log("Running RealESRGAN 4x Anime6B upscaler...")
                     with torch.no_grad():
                         t = torch.from_numpy(np.array(img)).permute(2,0,1).unsqueeze(0).half().to("cuda")/255.0
@@ -196,14 +203,18 @@ def gen(req: Req):
                 img.save(out_path)
                 log(f"Saved: {out_path}")
                 buf = BytesIO(); img.save(buf, format="PNG")
-                q.put(json.dumps({"type":"final","index":i,"image":"data:image/png;base64,"+base64.b64encode(buf.getvalue()).decode()}))
-            q.put(json.dumps({"type":"done"}))
+                job["finals"][i] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            job["status"] = "done"
         except Exception:
-            q.put(json.dumps({"type":"error","message":traceback.format_exc()}))
-        finally:
-            q.put(None)
+            job["status"] = "error"
+            job["error"] = traceback.format_exc()
+
     threading.Thread(target=work, daemon=True).start()
-    return StreamingResponse((f"data: {x}\n\n" for x in iter(q.get, None)), media_type="text/event-stream")
+    return {"job_id": job_id}
+
+@app.get("/job_status/{job_id}")
+def job_status(job_id: str):
+    return jobs.get(job_id, {"status": "error", "error": "Job not found"})
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -211,5 +222,5 @@ def index():
 
 threading.Thread(target=lambda: uvicorn.run(app, host="127.0.0.1", port=8000, log_level="error"), daemon=True).start()
 time.sleep(2)
-print("Studio ready. Opening window...")
-output.serve_kernel_port_as_window(8000)
+print("Studio ready.")
+output.serve_kernel_port_as_iframe(8000, height=850)
