@@ -220,7 +220,7 @@ def job_status(job_id: str):
 def index():
     return requests.get(UI_URL, timeout=15).text
 
-threading.Thread(target=lambda: uvicorn.run(app, host="127.0.0.1", port=8000, log_level="error"), daemon=True).start()
+threading.Thread(target=lambda: uvicorn.run(app, host="127.0.0.1", port=8005, log_level="error"), daemon=True).start()
 time.sleep(2)
 print("Studio ready.")
-output.serve_kernel_port_as_iframe(8000, height=850)
+output.serve_kernel_port_as_iframe(8005, height=850)
