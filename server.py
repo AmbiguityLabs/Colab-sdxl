@@ -20,10 +20,10 @@ if not os.path.exists('/content/drive/MyDrive'):
     drive.mount('/content/drive')
 
 base = "/content/drive/MyDrive/SDXL_Setup"
+lora_dir = f"{base}/loras"
 local_model = "/content/model.safetensors"
-upload_lora_dir = "/content/uploaded_loras"
 os.makedirs(f"{base}/outputs", exist_ok=True)
-os.makedirs(upload_lora_dir, exist_ok=True)
+os.makedirs(lora_dir, exist_ok=True)
 
 if not os.path.exists(local_model):
     shutil.copy(f"{base}/models/waiIllustriousSDXL_v170.safetensors", local_model)
@@ -39,8 +39,12 @@ upscale_model = spandrel.ModelLoader().load_from_file(f"{base}/upscalers/RealESR
 
 active_lora = {"name": None}
 
-def apply_lora(mode, local_name, remote_url, uploaded_name, weight, log_fn):
-    if mode == "none":
+def get_drive_loras():
+    if not os.path.exists(lora_dir): return []
+    return sorted([f for f in os.listdir(lora_dir) if f.endswith(".safetensors")])
+
+def apply_lora(lora_name, weight, log_fn):
+    if not lora_name or lora_name == "none":
         if active_lora["name"]:
             log_fn("Unloading active LoRA...")
             try: pipe.unload_lora_weights()
@@ -48,39 +52,18 @@ def apply_lora(mode, local_name, remote_url, uploaded_name, weight, log_fn):
             active_lora["name"] = None
         return
 
-    if mode == "local":
-        if not local_name: raise ValueError("No Drive LoRA selected.")
-        t_dir, t_file = f"{base}/loras", local_name
-    elif mode == "upload":
-        if not uploaded_name: raise ValueError("No uploaded LoRA file found. Please upload a .safetensors file first.")
-        t_dir, t_file = upload_lora_dir, uploaded_name
-    elif mode == "remote":
-        if not remote_url.strip(): raise ValueError("Remote LoRA URL is empty.")
-        fname = os.path.basename(urlparse(remote_url.strip()).path)
-        if not fname.endswith(".safetensors"): fname = f"lora_{abs(hash(remote_url))}.safetensors"
-        dest = f"{upload_lora_dir}/{fname}"
-        if not os.path.exists(dest):
-            log_fn(f"Downloading LoRA from URL: {remote_url.strip()}")
-            with requests.get(remote_url.strip(), stream=True, timeout=120) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for c in r.iter_content(8192): f.write(c)
-            log_fn(f"Downloaded LoRA: {fname}")
-        else:
-            log_fn(f"Using cached LoRA: {fname}")
-        t_dir, t_file = upload_lora_dir, fname
-    else:
-        return
+    lid = f"{lora_dir}/{lora_name}"
+    if not os.path.exists(lid):
+        raise FileNotFoundError(f"LoRA not found in Drive: {lora_name}")
 
-    lid = f"{t_dir}/{t_file}"
     if active_lora["name"] != lid:
-        log_fn(f"Loading LoRA weights: {t_file} (weight={weight})")
+        log_fn(f"Loading LoRA from Drive: {lora_name}")
         try: pipe.unload_lora_weights()
         except: pass
-        pipe.load_lora_weights(t_dir, weight_name=t_file, adapter_name="lora")
+        pipe.load_lora_weights(lora_dir, weight_name=lora_name, adapter_name="lora")
         active_lora["name"] = lid
     pipe.set_adapters(["lora"], adapter_weights=[weight])
-    log_fn(f"LoRA active: {t_file} at weight {weight}")
+    log_fn(f"LoRA active: {lora_name} (weight={weight})")
 
 RGB_MAT = torch.tensor([[0.3448,0.4168,0.4395],[-0.1953,-0.0290,0.0250],[0.1074,0.0886,-0.0163],[-0.3730,-0.2499,-0.2088]], dtype=torch.float16, device="cuda")
 
@@ -95,7 +78,7 @@ def adetail(img, p, np_txt, steps, cfg, ff, fh, ad_str, ad_blur, log_fn):
     for name, yolo in ([("Face", face_yolo)] if ff and face_yolo else []) + ([("Hand", hand_yolo)] if fh and hand_yolo else []):
         boxes = yolo(img, conf=0.35, verbose=False)[0].boxes.xyxy.cpu().numpy()
         log_fn(f"ADetailer ({name}): detected {len(boxes)} region(s)")
-        for idx, box in enumerate(boxes):
+        for box in boxes:
             x1, y1, x2, y2 = map(int, box)
             mask = Image.new("L", img.size, 0)
             ImageDraw.Draw(mask).rectangle([max(0, x1-16), max(0, y1-16), min(img.width, x2+16), min(img.height, y2+16)], fill=255)
@@ -110,37 +93,61 @@ def adetail(img, p, np_txt, steps, cfg, ff, fh, ad_str, ad_blur, log_fn):
 
 app = FastAPI()
 
+@app.get("/list_loras")
+def list_loras():
+    return {"loras": get_drive_loras()}
+
 @app.post("/upload_lora")
 async def upload_lora(file: UploadFile = File(...)):
     try:
         fname = os.path.basename(file.filename)
         if not fname.endswith(".safetensors"):
             return JSONResponse({"ok": False, "error": "Only .safetensors files are supported."}, status_code=400)
-        dest = os.path.join(upload_lora_dir, fname)
+        dest = os.path.join(lora_dir, fname)
         with open(dest, "wb") as f:
             while chunk := await file.read(1024 * 1024):
                 f.write(chunk)
-        return {"ok": True, "filename": fname, "size_mb": round(os.path.getsize(dest) / (1024*1024), 2)}
-    except Exception as e:
+        return {"ok": True, "filename": fname, "loras": get_drive_loras()}
+    except Exception:
+        return JSONResponse({"ok": False, "error": traceback.format_exc()}, status_code=500)
+
+class UrlReq(BaseModel):
+    url: str
+
+@app.post("/download_lora")
+def download_lora(req: UrlReq):
+    try:
+        u = req.url.strip()
+        if not u:
+            return JSONResponse({"ok": False, "error": "URL is empty."}, status_code=400)
+        fname = os.path.basename(urlparse(u).path)
+        if not fname.endswith(".safetensors"):
+            fname = f"lora_{abs(hash(u))}.safetensors"
+        dest = os.path.join(lora_dir, fname)
+        if not os.path.exists(dest):
+            with requests.get(u, stream=True, timeout=180) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for c in r.iter_content(8192): f.write(c)
+        return {"ok": True, "filename": fname, "loras": get_drive_loras()}
+    except Exception:
         return JSONResponse({"ok": False, "error": traceback.format_exc()}, status_code=500)
 
 class Req(BaseModel):
     prompt: str; neg_prompt: str; width: int; height: int; steps: int; cfg: float
-    batch_count: int = 1
-    lora_mode: str = "none"; local_lora: str = ""; remote_url: str = ""; uploaded_lora: str = ""; lora_weight: float = 0.8
+    batch_count: int = 1; lora_name: str = "none"; lora_weight: float = 0.8
     fix_face: bool = False; fix_hand: bool = False; ad_str: float = 0.4; ad_blur: int = 4; upscale: bool = False
 
 @app.post("/generate_stream")
 def gen(req: Req):
     q = queue.Queue()
     def log(msg):
-        print(f"[STUDIO] {msg}")
         q.put(json.dumps({"type": "log", "message": msg}))
 
     def work():
         try:
             log("Starting generation pipeline...")
-            apply_lora(req.lora_mode, req.local_lora, req.remote_url, req.uploaded_lora, req.lora_weight, log)
+            apply_lora(req.lora_name, req.lora_weight, log)
             for i in range(max(1, min(req.batch_count, 8))):
                 log(f"Generating image {i+1}/{req.batch_count} ({req.width}x{req.height}, steps={req.steps})")
                 cb = lambda p, s, ts, kw: (q.put(json.dumps({"type":"preview","index":i,"step":s+1,"total_steps":req.steps,"image":to_b64(kw["latents"])})), kw)[1]
@@ -165,9 +172,7 @@ def gen(req: Req):
                 q.put(json.dumps({"type":"final","index":i,"image":"data:image/png;base64,"+base64.b64encode(buf.getvalue()).decode()}))
             q.put(json.dumps({"type":"done"}))
         except Exception:
-            err_trace = traceback.format_exc()
-            print(err_trace)
-            q.put(json.dumps({"type":"error","message":err_trace}))
+            q.put(json.dumps({"type":"error","message":traceback.format_exc()}))
         finally:
             q.put(None)
     threading.Thread(target=work, daemon=True).start()
@@ -175,9 +180,7 @@ def gen(req: Req):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    html = requests.get(UI_URL, timeout=15).text
-    loras = [f for f in os.listdir(f"{base}/loras") if f.endswith(".safetensors")] if os.path.exists(f"{base}/loras") else []
-    return html.replace("__LORA_OPTIONS__", "".join([f'<option value="{f}">{f}</option>' for f in loras]))
+    return requests.get(UI_URL, timeout=15).text
 
 threading.Thread(target=lambda: uvicorn.run(app, host="127.0.0.1", port=8000, log_level="error"), daemon=True).start()
 time.sleep(2)
